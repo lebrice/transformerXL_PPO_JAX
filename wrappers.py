@@ -1,12 +1,13 @@
+from functools import partial
+from typing import Any, Union
+
+import chex
 import jax
 import jax.numpy as jnp
-import chex
-import numpy as np
 from flax import struct
-from functools import partial
-from typing import Optional, Tuple, Union, Any
 
-#Taken from https://github.com/MichaelTMatthews/Craftax_Baselines/blob/main/wrappers.py
+# Taken from https://github.com/MichaelTMatthews/Craftax_Baselines/blob/main/wrappers.py
+
 
 class GymnaxWrapper(object):
     """Base class for Gymnax wrappers."""
@@ -69,7 +70,7 @@ class AutoResetEnvWrapper(GymnaxWrapper):
 
         # Auto-reset environment based on termination
         def auto_reset(done, state_re, state_st, obs_re, obs_st):
-            state = jax.tree_map(
+            state = jax.tree.map(
                 lambda x, y: jax.lax.select(done, x, y), state_re, state_st
             )
             obs = jax.lax.select(done, obs_re, obs_st)
@@ -94,9 +95,9 @@ class OptimisticResetVecEnvWrapper(GymnaxWrapper):
 
         self.num_envs = num_envs
         self.reset_ratio = reset_ratio
-        assert (
-            num_envs % reset_ratio == 0
-        ), "Reset ratio must perfectly divide num envs."
+        assert num_envs % reset_ratio == 0, (
+            "Reset ratio must perfectly divide num envs."
+        )
         self.num_resets = self.num_envs // reset_ratio
 
         self.reset_fn = jax.vmap(self._env.reset, in_axes=(0, None))
@@ -133,11 +134,11 @@ class OptimisticResetVecEnvWrapper(GymnaxWrapper):
         reset_indexes = reset_indexes.at[being_reset].set(jnp.arange(self.num_resets))
 
         obs_re = obs_re[reset_indexes]
-        state_re = jax.tree_map(lambda x: x[reset_indexes], state_re)
+        state_re = jax.tree.map(lambda x: x[reset_indexes], state_re)
 
         # Auto-reset environment based on termination
         def auto_reset(done, state_re, state_st, obs_re, obs_st):
-            state = jax.tree_map(
+            state = jax.tree.map(
                 lambda x, y: jax.lax.select(done, x, y), state_re, state_st
             )
             obs = jax.lax.select(done, obs_re, obs_st)
