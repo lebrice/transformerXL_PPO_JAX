@@ -8,6 +8,7 @@ dependencies = [
     "chex>=0.1.91",
     "craftax>=1.5.0",
     "distrax>=0.1.7",
+    "einops>=0.8.2",
     "flax>=0.12.4",
     "gymnasium>=1.2.3",
     "gymnax>=0.0.9",

@@ -1,6 +1,8 @@
-from typing import NamedTuple, Sequence
+import functools
+from typing import Any, NamedTuple, Sequence
 
 import distrax
+import einops
 import flax.linen as nn
 import gymnax
 import jax
@@ -9,6 +11,8 @@ import numpy as np
 import optax
 from flax.linen.initializers import constant, orthogonal
 from flax.training.train_state import TrainState
+from gymnax.environments import EnvState
+from gymnax.environments.environment import Environment, EnvParams
 from gymnax.wrappers.purerl import FlattenObservationWrapper
 
 from transformerXL import Transformer
@@ -148,10 +152,25 @@ class Transition(NamedTuple):
 indices_select = lambda x, y: x[y]
 batch_indices_select = jax.vmap(indices_select)
 roll_vmap = jax.vmap(jnp.roll, in_axes=(-2, 0, None), out_axes=-2)
-batchify = lambda x: jnp.reshape(x, (x.shape[0] * x.shape[1],) + x.shape[2:])
 
 
-def make_train(config):
+# batchify = lambda x: jnp.reshape(x, (x.shape[0] * x.shape[1],) + x.shape[2:])
+def batchify(x: jax.Array) -> jax.Array:
+    return einops.rearrange(x, "a b ... -> (a b) ...")
+
+
+def linear_schedule(
+    count,
+    num_minibatches: int,
+    update_epochs: int,
+    num_updates: int,
+    lr: float,
+):
+    frac = 1.0 - (count // (num_minibatches * update_epochs)) / (num_updates)
+    return lr * frac
+
+
+def make_train(config: dict[str, Any]):
 
     config["NUM_UPDATES"] = (
         config["TOTAL_TIMESTEPS"] // config["NUM_STEPS"] // config["NUM_ENVS"]
@@ -179,452 +198,540 @@ def make_train(config):
         env = LogWrapper(env)
         env = BatchEnvWrapper(env, config["NUM_ENVS"])
 
-    def linear_schedule(count):
-        frac = (
-            1.0
-            - (count // (config["NUM_MINIBATCHES"] * config["UPDATE_EPOCHS"]))
-            / (config["NUM_UPDATES"])
-        )
-        return config["LR"] * frac
+    return lambda rng: train(
+        rng,
+        env=env,
+        env_params=env_params,
+        config=config,
+    )
 
-    def train(rng):
 
-        # INIT NETWORK
-        network = ActorCriticTransformer(
-            action_dim=env.action_space(env_params).n,
-            activation=config["ACTIVATION"],
-            encoder_size=config["EMBED_SIZE"],
-            hidden_layers=config["hidden_layers"],
-            num_heads=config["num_heads"],
-            qkv_features=config["qkv_features"],
-            num_layers=config["num_layers"],
-            gating=config["gating"],
-            gating_bias=config["gating_bias"],
-        )
-        rng, _rng = jax.random.split(rng)
-        init_obs = jnp.zeros((2, env.observation_space(env_params).shape[0]))
-        init_memory = jnp.zeros(
-            (2, config["WINDOW_MEM"], config["num_layers"], config["EMBED_SIZE"])
-        )
-        init_mask = jnp.zeros(
-            (2, config["num_heads"], 1, config["WINDOW_MEM"] + 1), dtype=jnp.bool_
-        )
-        network_params = network.init(_rng, init_memory, init_obs, init_mask)
+def train(rng: jax.Array, env: Environment, env_params: EnvParams, config: dict):
+    # INIT NETWORK
+    network = ActorCriticTransformer(
+        action_dim=env.action_space(env_params).n,
+        activation=config["ACTIVATION"],
+        encoder_size=config["EMBED_SIZE"],
+        hidden_layers=config["hidden_layers"],
+        num_heads=config["num_heads"],
+        qkv_features=config["qkv_features"],
+        num_layers=config["num_layers"],
+        gating=config["gating"],
+        gating_bias=config["gating_bias"],
+    )
+    rng, _rng = jax.random.split(rng)
+    init_obs = jnp.zeros((2, env.observation_space(env_params).shape[0]))
+    init_memory = jnp.zeros(
+        (2, config["WINDOW_MEM"], config["num_layers"], config["EMBED_SIZE"])
+    )
+    init_mask = jnp.zeros(
+        (2, config["num_heads"], 1, config["WINDOW_MEM"] + 1), dtype=jnp.bool_
+    )
+    network_params = network.init(_rng, init_memory, init_obs, init_mask)
 
-        if config["ANNEAL_LR"]:
-            tx = optax.chain(
-                optax.clip_by_global_norm(config["MAX_GRAD_NORM"]),
-                optax.adam(learning_rate=linear_schedule, eps=1e-5),
-            )
-        else:
-            tx = optax.chain(
-                optax.clip_by_global_norm(config["MAX_GRAD_NORM"]),
-                optax.adam(config["LR"], eps=1e-5),
-            )
-
-        train_state = TrainState.create(
-            apply_fn=network.apply,
-            params=network_params,
-            tx=tx,
-        )
-
-        # Reset ENV
-        rng, _rng = jax.random.split(rng)
-        obsv, env_state = env.reset(_rng, env_params)
-        # reset_rng = jax.random.split(_rng, config["NUM_ENVS"])
-        # obsv, env_state = jax.vmap(env.reset, in_axes=(0, None))(reset_rng, env_params)
-
-        # TRAIN LOOP
-        def _update_step(runner_state, unused):
-
-            # COLLECT TRAJECTORIES
-            def _env_step(runner_state, unused):
-                (
-                    train_state,
-                    env_state,
-                    memories,
-                    memories_mask,
-                    memories_mask_idx,
-                    last_obs,
-                    done,
-                    step_env_currentloop,
-                    rng,
-                ) = runner_state
-
-                # reset memories mask and mask idx in cask of done otherwise mask will consider one more stepif not filled (if filled=
-                memories_mask_idx = jnp.where(
-                    done,
-                    config["WINDOW_MEM"],
-                    jnp.clip(memories_mask_idx - 1, 0, config["WINDOW_MEM"]),
-                )
-                memories_mask = jnp.where(
-                    done[:, None, None, None],
-                    jnp.zeros(
-                        (
-                            config["NUM_ENVS"],
-                            config["num_heads"],
-                            1,
-                            config["WINDOW_MEM"] + 1,
-                        ),
-                        dtype=jnp.bool_,
-                    ),
-                    memories_mask,
-                )
-
-                # Update memories mask with the potential additional step taken into account at this step
-                memories_mask_idx_ohot = jax.nn.one_hot(
-                    memories_mask_idx, config["WINDOW_MEM"] + 1
-                )
-                memories_mask_idx_ohot = memories_mask_idx_ohot[
-                    :, None, None, :
-                ].repeat(config["num_heads"], 1)
-                memories_mask = jnp.logical_or(memories_mask, memories_mask_idx_ohot)
-
-                # SELECT ACTION
-                rng, _rng = jax.random.split(rng)
-                pi, value, memories_out = network.apply(
-                    train_state.params,
-                    memories,
-                    last_obs,
-                    memories_mask,
-                    method=network.model_forward_eval,
-                )
-                action = pi.sample(seed=_rng)
-                log_prob = pi.log_prob(action)
-
-                # ADD THE CACHED ACTIVATIONS IN MEMORIES FOR NEXT STEP
-                memories = jnp.roll(memories, -1, axis=1).at[:, -1].set(memories_out)
-
-                # STEP ENV
-                rng, _rng = jax.random.split(rng)
-                # rng_step = jax.random.split(_rng, config["NUM_ENVS"])
-                # obsv, env_state, reward, done, info = jax.vmap(env.step, in_axes=(0,0,0,None))(
-                #    rng_step, env_state, action, env_params
-                # )
-                obsv, env_state, reward, done, info = env.step(
-                    _rng, env_state, action, env_params
-                )
-
-                # COMPUTE THE INDICES OF THE FINAL MEMORIES THAT ARE TAKEN INTO ACCOUNT IN THIS STEP
-                # not forgeeting that we will concatenate the previous WINDOW_MEM to the NUM_STEPS so that even the first step will use some cached memory.
-                # previous without this is attend to 0 which are masked but with reset happening if we start the num_steps loop during good to keep memory from previous
-                memory_indices = jnp.arange(0, config["WINDOW_MEM"])[
-                    None, :
-                ] + step_env_currentloop * jnp.ones(
-                    (config["NUM_ENVS"], 1), dtype=jnp.int32
-                )
-
-                transition = Transition(
-                    done,
-                    action,
-                    value,
-                    reward,
-                    log_prob,
-                    memories_mask.squeeze(),
-                    memory_indices,
-                    last_obs,
-                    info,
-                )
-                runner_state = (
-                    train_state,
-                    env_state,
-                    memories,
-                    memories_mask,
-                    memories_mask_idx,
-                    obsv,
-                    done,
-                    step_env_currentloop + 1,
-                    rng,
-                )
-                return runner_state, (transition, memories_out)
-
-            # also copy the first memories in memories_previous before the new rollout to concatenate previous memories with new steps so that first steps of new have memories
-            memories_previous = runner_state[2]
-
-            # SCAN THE STEP TO GET THE TRANSITIONS AND CACHED MEMORIES
-            runner_state, (traj_batch, memories_batch) = jax.lax.scan(
-                _env_step, runner_state, None, config["NUM_STEPS"]
-            )
-
-            # CALCULATE ADVANTAGE
-            (
-                train_state,
-                env_state,
-                memories,
-                memories_mask,
-                memories_mask_idx,
-                last_obs,
-                done,
-                _,
-                rng,
-            ) = runner_state
-            _, last_val, _ = network.apply(
-                train_state.params,
-                memories,
-                last_obs,
-                memories_mask,
-                method=network.model_forward_eval,
-            )
-
-            def _calculate_gae(traj_batch, last_val):
-                def _get_advantages(gae_and_next_value, transition):
-                    gae, next_value = gae_and_next_value
-                    done, value, reward = (
-                        transition.done,
-                        transition.value,
-                        transition.reward,
-                    )
-                    delta = reward + config["GAMMA"] * next_value * (1 - done) - value
-                    gae = (
-                        delta
-                        + config["GAMMA"] * config["GAE_LAMBDA"] * (1 - done) * gae
-                    )
-                    return (gae, value), gae
-
-                _, advantages = jax.lax.scan(
-                    _get_advantages,
-                    (jnp.zeros_like(last_val), last_val),
-                    traj_batch,
-                    reverse=True,
-                    unroll=16,
-                )
-                return advantages, advantages + traj_batch.value
-
-            advantages, targets = _calculate_gae(traj_batch, last_val)
-
-            # UPDATE NETWORK
-            def _update_epoch(update_state, unused):
-                def _update_minbatch(train_state, batch_info):
-
-                    traj_batch, memories_batch, advantages, targets = batch_info
-
-                    def _loss_fn(params, traj_batch, memories_batch, gae, targets):
-
-                        # USE THE CACHED MEMORIES ONLY FROM THE FIRST STEP OF A WINDOW GRAD Because all other will be computed again here.
-                        # construct the memory batch from memory indices
-                        memories_batch = batch_indices_select(
-                            memories_batch,
-                            traj_batch.memories_indices[:, :: config["WINDOW_GRAD"]],
-                        )
-                        memories_batch = batchify(memories_batch)
-
-                        # CREATE THE MASK FOR WINDOW GRAD (have to take the one from the batch and roll them to match the steps it attends
-                        memories_mask = traj_batch.memories_mask.reshape(
-                            (
-                                -1,
-                                config["WINDOW_GRAD"],
-                            )
-                            + traj_batch.memories_mask.shape[2:]
-                        )
-                        memories_mask = jnp.swapaxes(memories_mask, 1, 2)
-                        # concatenate with 0s to fill before the roll
-                        memories_mask = jnp.concatenate(
-                            (
-                                memories_mask,
-                                jnp.zeros(
-                                    memories_mask.shape[:-1]
-                                    + (config["WINDOW_GRAD"] - 1,),
-                                    dtype=jnp.bool_,
-                                ),
-                            ),
-                            axis=-1,
-                        )
-                        # roll of different value for each step to match the right
-                        memories_mask = roll_vmap(
-                            memories_mask, jnp.arange(0, config["WINDOW_GRAD"]), -1
-                        )
-
-                        # RESHAPE
-                        obs = traj_batch.obs
-                        obs = obs.reshape(
-                            (
-                                -1,
-                                config["WINDOW_GRAD"],
-                            )
-                            + obs.shape[2:]
-                        )
-
-                        traj_batch, targets, gae = jax.tree_util.tree_map(
-                            lambda x: jnp.reshape(
-                                x, (-1, config["WINDOW_GRAD"]) + x.shape[2:]
-                            ),
-                            (traj_batch, targets, gae),
-                        )
-
-                        # NETWORK OUTPUT
-                        pi, value = network.apply(
-                            params,
-                            memories_batch,
-                            obs,
-                            memories_mask,
-                            method=network.model_forward_train,
-                        )
-
-                        log_prob = pi.log_prob(traj_batch.action)
-
-                        # CALCULATE VALUE LOSS
-                        value_pred_clipped = traj_batch.value + (
-                            value - traj_batch.value
-                        ).clip(-config["CLIP_EPS"], config["CLIP_EPS"])
-                        value_losses = jnp.square(value - targets)
-                        value_losses_clipped = jnp.square(value_pred_clipped - targets)
-                        value_loss = (
-                            0.5 * jnp.maximum(value_losses, value_losses_clipped).mean()
-                        )
-
-                        # CALCULATE ACTOR LOSS
-                        ratio = jnp.exp(log_prob - traj_batch.log_prob)
-                        gae = (gae - gae.mean()) / (gae.std() + 1e-8)
-                        loss_actor1 = ratio * gae
-                        loss_actor2 = (
-                            jnp.clip(
-                                ratio,
-                                1.0 - config["CLIP_EPS"],
-                                1.0 + config["CLIP_EPS"],
-                            )
-                            * gae
-                        )
-                        loss_actor = -jnp.minimum(loss_actor1, loss_actor2)
-                        loss_actor = loss_actor.mean()
-                        entropy = pi.entropy().mean()
-
-                        total_loss = (
-                            loss_actor
-                            + config["VF_COEF"] * value_loss
-                            - config["ENT_COEF"] * entropy
-                        )
-                        return total_loss, (value_loss, loss_actor, entropy)
-
-                    grad_fn = jax.value_and_grad(_loss_fn, has_aux=True)
-                    total_loss, grads = grad_fn(
-                        train_state.params,
-                        traj_batch,
-                        memories_batch,
-                        advantages,
-                        targets,
-                    )
-                    train_state = train_state.apply_gradients(grads=grads)
-                    return train_state, total_loss
-
-                train_state, traj_batch, memories_batch, advantages, targets, rng = (
-                    update_state
-                )
-                rng, _rng = jax.random.split(rng)
-                # batch_size = config["MINIBATCH_SIZE"] * config["NUM_MINIBATCHES"]
-                assert config["NUM_STEPS"] % config["WINDOW_GRAD"] == 0, (
-                    "NUM_STEPS should be divi by WINDOW_GRAD to properly batch the window_grad"
-                )
-
-                # PERMUTE ALONG THE NUM_ENVS ONLY NOT TO LOOSE TRACK FROM TEMPORAL
-                permutation = jax.random.permutation(_rng, config["NUM_ENVS"])
-                batch = (traj_batch, memories_batch, advantages, targets)
-                batch = jax.tree_util.tree_map(
-                    lambda x: jnp.swapaxes(x, 0, 1),
-                    batch,
-                )
-                shuffled_batch = jax.tree_util.tree_map(
-                    lambda x: jnp.take(x, permutation, axis=0), batch
-                )
-
-                # either create memory batch here but might be big  or send all the memeory to loss and do the things with the index in the loss
-                minibatches = jax.tree_util.tree_map(
-                    lambda x: jnp.reshape(
-                        x, [config["NUM_MINIBATCHES"], -1] + list(x.shape[1:])
-                    ),
-                    shuffled_batch,
-                )
-
-                train_state, total_loss = jax.lax.scan(
-                    _update_minbatch, train_state, minibatches
-                )
-
-                update_state = (
-                    train_state,
-                    traj_batch,
-                    memories_batch,
-                    advantages,
-                    targets,
-                    rng,
-                )
-                return update_state, total_loss
-
-            # ADD PREVIOUS WINDOW_MEM To the current NUM_STEPS SO THAT FIRST STEPS USE MEMORIES FROM PREVIOUS
-            # might be a better place to add the previous memory to the traj batch to make it faster ???
-            # or another solution is to not add it but in training means that the first element might not look at info
-            memories_batch = jnp.concatenate(
-                [jnp.swapaxes(memories_previous, 0, 1), memories_batch], axis=0
-            )
-
-            # CRAFTAX ONLY
-            metric = jax.tree.map(
-                lambda x: (
-                    (x * traj_batch.info["returned_episode"]).sum()
-                    / traj_batch.info["returned_episode"].sum()
+    if config["ANNEAL_LR"]:
+        tx = optax.chain(
+            optax.clip_by_global_norm(config["MAX_GRAD_NORM"]),
+            optax.adam(
+                learning_rate=lambda count: linear_schedule(
+                    count,
+                    num_minibatches=config["NUM_MINIBATCHES"],
+                    update_epochs=config["UPDATE_EPOCHS"],
+                    num_updates=config["NUM_UPDATES"],
+                    lr=config["LR"],
                 ),
-                traj_batch.info,
-            )
-            metric = jax.tree.map(lambda x: x.mean(), metric)
+                eps=1e-5,
+            ),
+        )
+    else:
+        tx = optax.chain(
+            optax.clip_by_global_norm(config["MAX_GRAD_NORM"]),
+            optax.adam(config["LR"], eps=1e-5),
+        )
 
-            update_state = (
-                train_state,
-                traj_batch,
-                memories_batch,
-                advantages,
-                targets,
-                rng,
-            )
-            update_state, loss_info = jax.lax.scan(
-                _update_epoch, update_state, None, config["UPDATE_EPOCHS"]
-            )
-            train_state = update_state[0]
-            rng = update_state[-1]
-            runner_state = (
-                train_state,
-                env_state,
-                memories,
-                memories_mask,
-                memories_mask_idx,
-                last_obs,
-                done,
-                0,
-                rng,
-            )
-            return runner_state, metric
+    train_state = TrainState.create(
+        apply_fn=network.apply,
+        params=network_params,
+        tx=tx,
+    )
 
-        # INITIALIZE the memories and memories mask
-        rng, _rng = jax.random.split(rng)
-        memories = jnp.zeros(
+    # Reset ENV
+    rng, _rng = jax.random.split(rng)
+    obsv, env_state = env.reset(_rng, env_params)
+    # reset_rng = jax.random.split(_rng, config["NUM_ENVS"])
+    # obsv, env_state = jax.vmap(env.reset, in_axes=(0, None))(reset_rng, env_params)
+
+    # TRAIN LOOP
+    # update_step = lambda carry, _: _update_step(carry, None, env, env_params, config)
+    # INITIALIZE the memories and memories mask
+    rng, _rng = jax.random.split(rng)
+    memories = jnp.zeros(
+        (
+            config["NUM_ENVS"],
+            config["WINDOW_MEM"],
+            config["num_layers"],
+            config["EMBED_SIZE"],
+        )
+    )
+    memories_mask = jnp.zeros(
+        (config["NUM_ENVS"], config["num_heads"], 1, config["WINDOW_MEM"] + 1),
+        dtype=jnp.bool_,
+    )
+    # memories +1 bc will remove one
+    memories_mask_idx = jnp.zeros((config["NUM_ENVS"],), dtype=jnp.int32) + (
+        config["WINDOW_MEM"] + 1
+    )
+    done = jnp.zeros((config["NUM_ENVS"],), dtype=jnp.bool_)
+
+    runner_state = RunnerState(
+        train_state,
+        env_state,
+        memories,
+        memories_mask,
+        memories_mask_idx,
+        obsv,
+        done,
+        0,
+        _rng,
+    )
+    runner_state, metric = jax.lax.scan(
+        lambda runner_state, _step: _update_step(
+            runner_state,
+            _step,
+            memories_mask=memories_mask,
+            network=network,
+            env=env,
+            env_params=env_params,
+            config=config,
+        ),
+        init=runner_state,
+        xs=jnp.arange(config["NUM_UPDATES"]),  # was None, doesn't hurt to pass it.
+        length=config["NUM_UPDATES"],
+    )
+    return {"runner_state": runner_state, "metrics": metric}
+
+
+class RunnerState(NamedTuple):
+    train_state: TrainState
+    env_state: EnvState
+    memories: jax.Array  # num_envs window_mem num_layers embed_size
+    memories_mask: jax.Array  # num_envs num_heads 1 window_mem+1
+    memories_mask_idx: jax.Array  # num_envs
+    obsv: jax.Array
+    done: jax.Array
+    steps: jax.Array
+    rng: jax.Array
+
+
+class UpdateState(NamedTuple):
+    train_state: TrainState
+    traj_batch: Transition
+    memories_batch: jax.Array
+    advantages: jax.Array
+    targets: jax.Array
+    rng: jax.Array
+
+
+def _env_step(
+    runner_state: RunnerState,
+    _step_index: jax.Array,
+    env: Environment,
+    env_params: EnvParams,
+    config: dict[str, Any],
+    network: ActorCriticTransformer,
+):
+    (
+        train_state,
+        env_state,
+        memories,
+        memories_mask,
+        memories_mask_idx,
+        last_obs,
+        done,
+        step_env_currentloop,
+        rng,
+    ) = runner_state
+
+    # reset memories mask and mask idx in cask of done otherwise mask will consider one more stepif not filled (if filled=
+    memories_mask_idx = jnp.where(
+        done,
+        config["WINDOW_MEM"],
+        jnp.clip(memories_mask_idx - 1, 0, config["WINDOW_MEM"]),
+    )
+    memories_mask = jnp.where(
+        done[:, None, None, None],
+        jnp.zeros(
             (
                 config["NUM_ENVS"],
-                config["WINDOW_MEM"],
-                config["num_layers"],
-                config["EMBED_SIZE"],
-            )
-        )
-        memories_mask = jnp.zeros(
-            (config["NUM_ENVS"], config["num_heads"], 1, config["WINDOW_MEM"] + 1),
+                config["num_heads"],
+                1,
+                config["WINDOW_MEM"] + 1,
+            ),
             dtype=jnp.bool_,
-        )
-        # memories +1 bc will remove one
-        memories_mask_idx = jnp.zeros((config["NUM_ENVS"],), dtype=jnp.int32) + (
-            config["WINDOW_MEM"] + 1
-        )
-        done = jnp.zeros((config["NUM_ENVS"],), dtype=jnp.bool_)
+        ),
+        memories_mask,
+    )
 
-        runner_state = (
-            train_state,
-            env_state,
-            memories,
+    # Update memories mask with the potential additional step taken into account at this step
+    memories_mask_idx_ohot = jax.nn.one_hot(memories_mask_idx, config["WINDOW_MEM"] + 1)
+    memories_mask_idx_ohot = memories_mask_idx_ohot[:, None, None, :].repeat(
+        config["num_heads"], 1
+    )
+    assert isinstance(memories_mask, jax.Array)
+    memories_mask = jnp.logical_or(memories_mask, memories_mask_idx_ohot)
+
+    # SELECT ACTION
+    rng, _rng = jax.random.split(rng)
+    pi, value, memories_out = network.apply(
+        train_state.params,
+        memories,
+        last_obs,
+        memories_mask,
+        method=network.model_forward_eval,
+    )
+    action = pi.sample(seed=_rng)
+    log_prob = pi.log_prob(action)
+
+    # ADD THE CACHED ACTIVATIONS IN MEMORIES FOR NEXT STEP
+    memories = jnp.roll(memories, -1, axis=1).at[:, -1].set(memories_out)
+
+    # STEP ENV
+    rng, _rng = jax.random.split(rng)
+    # rng_step = jax.random.split(_rng, config["NUM_ENVS"])
+    # obsv, env_state, reward, done, info = jax.vmap(env.step, in_axes=(0,0,0,None))(
+    #    rng_step, env_state, action, env_params
+    # )
+    obsv, env_state, reward, done, info = env.step(_rng, env_state, action, env_params)
+
+    # COMPUTE THE INDICES OF THE FINAL MEMORIES THAT ARE TAKEN INTO ACCOUNT IN THIS STEP
+    # not forgeeting that we will concatenate the previous WINDOW_MEM to the NUM_STEPS so that even the first step will use some cached memory.
+    # previous without this is attend to 0 which are masked but with reset happening if we start the num_steps loop during good to keep memory from previous
+    memory_indices = jnp.arange(0, config["WINDOW_MEM"])[
+        None, :
+    ] + step_env_currentloop * jnp.ones((config["NUM_ENVS"], 1), dtype=jnp.int32)
+    assert isinstance(value, jax.Array)
+    transition = Transition(
+        done,
+        action,
+        value,
+        reward,
+        log_prob,
+        memories_mask.squeeze(),
+        memory_indices,
+        last_obs,
+        info,
+    )
+    assert isinstance(memories_mask_idx, jax.Array)
+    runner_state = RunnerState(
+        train_state,
+        env_state,
+        memories,
+        memories_mask,
+        memories_mask_idx,
+        obsv,
+        done,
+        step_env_currentloop + 1,
+        rng,
+    )
+    return runner_state, (transition, memories_out)
+
+
+def _update_step(
+    runner_state: RunnerState,
+    _update_index: jax.Array,
+    *,
+    memories_mask: jax.Array,
+    network: ActorCriticTransformer,
+    env: Environment,
+    env_params: EnvParams,
+    config: dict[str, Any],
+) -> tuple[RunnerState, dict[str, jax.Array]]:
+    # COLLECT TRAJECTORIES
+    # also copy the first memories in memories_previous before the new rollout to concatenate previous memories with new steps so that first steps of new have memories
+    memories_previous = runner_state[2]
+
+    # SCAN THE STEP TO GET THE TRANSITIONS AND CACHED MEMORIES
+    runner_state, (traj_batch, memories_batch) = jax.lax.scan(
+        lambda _runner_state, _step: _env_step(
+            _runner_state,
+            _step,
+            env=env,
+            env_params=env_params,
+            network=network,
+            config=config,
+        ),
+        init=runner_state,
+        xs=jnp.arange(config["NUM_STEPS"]),
+        length=config["NUM_STEPS"],
+    )
+
+    # CALCULATE ADVANTAGE
+    (
+        train_state,
+        env_state,
+        memories,
+        memories_mask,
+        memories_mask_idx,
+        last_obs,
+        done,
+        _,
+        rng,
+    ) = runner_state
+    _, last_val, _ = network.apply(
+        train_state.params,
+        memories,
+        last_obs,
+        memories_mask,
+        method=network.model_forward_eval,
+    )
+
+    advantages, targets = _calculate_gae(traj_batch, last_val, config=config)
+
+    # UPDATE NETWORK
+    # ADD PREVIOUS WINDOW_MEM To the current NUM_STEPS SO THAT FIRST STEPS USE MEMORIES FROM PREVIOUS
+    # might be a better place to add the previous memory to the traj batch to make it faster ???
+    # or another solution is to not add it but in training means that the first element might not look at info
+    memories_batch = jnp.concatenate(
+        [jnp.swapaxes(memories_previous, 0, 1), memories_batch], axis=0
+    )
+
+    # CRAFTAX ONLY
+    metric = jax.tree.map(
+        lambda x: (
+            (x * traj_batch.info["returned_episode"]).sum()
+            / traj_batch.info["returned_episode"].sum()
+        ),
+        traj_batch.info,
+    )
+    metric = jax.tree.map(lambda x: x.mean(), metric)
+
+    update_state = UpdateState(
+        train_state=train_state,
+        traj_batch=traj_batch,
+        memories_batch=memories_batch,
+        advantages=advantages,
+        targets=targets,
+        rng=rng,
+    )
+    update_state, loss_info = jax.lax.scan(
+        lambda _update_state, _step: _update_epoch(
+            _update_state,
+            _step,
+            network=network,
+            config=config,
+        ),
+        update_state,
+        None,
+        config["UPDATE_EPOCHS"],
+    )
+    train_state = update_state[0]
+    rng = update_state[-1]
+    runner_state = RunnerState(
+        train_state,
+        env_state,
+        memories,
+        memories_mask,
+        memories_mask_idx,
+        last_obs,
+        done,
+        0,
+        rng,
+    )
+    return runner_state, metric
+
+
+def _update_epoch(
+    update_state: UpdateState,
+    _index: jax.Array,
+    *,
+    network: ActorCriticTransformer,
+    config: dict[str, Any],
+) -> tuple[UpdateState, dict[str, jax.Array]]:
+    train_state, traj_batch, memories_batch, advantages, targets, rng = update_state
+    rng, _rng = jax.random.split(rng)
+    # batch_size = config["MINIBATCH_SIZE"] * config["NUM_MINIBATCHES"]
+    assert config["NUM_STEPS"] % config["WINDOW_GRAD"] == 0, (
+        "NUM_STEPS should be divi by WINDOW_GRAD to properly batch the window_grad"
+    )
+
+    # PERMUTE ALONG THE NUM_ENVS ONLY NOT TO LOOSE TRACK FROM TEMPORAL
+    permutation = jax.random.permutation(_rng, config["NUM_ENVS"])
+    batch = (traj_batch, memories_batch, advantages, targets)
+    batch = jax.tree_util.tree_map(
+        lambda x: jnp.swapaxes(x, 0, 1),
+        batch,
+    )
+    shuffled_batch = jax.tree_util.tree_map(
+        lambda x: jnp.take(x, permutation, axis=0), batch
+    )
+
+    # either create memory batch here but might be big  or send all the memeory to loss and do the things with the index in the loss
+    minibatches = jax.tree_util.tree_map(
+        lambda x: jnp.reshape(x, [config["NUM_MINIBATCHES"], -1] + list(x.shape[1:])),
+        shuffled_batch,
+    )
+
+    train_state, total_loss = jax.lax.scan(
+        lambda _train_state, _step: _update_minbatch(
+            _train_state,
+            _step,
+            network=network,
+            config=config,
+        ),
+        train_state,
+        minibatches,
+    )
+
+    update_state = UpdateState(
+        train_state=train_state,
+        traj_batch=traj_batch,
+        memories_batch=memories_batch,
+        advantages=advantages,
+        targets=targets,
+        rng=rng,
+    )
+    return update_state, total_loss
+
+
+def _update_minbatch(
+    train_state: TrainState,
+    batch_info: tuple[Transition, jax.Array, jax.Array, jax.Array],
+    *,
+    network: ActorCriticTransformer,
+    config: dict[str, Any],
+) -> tuple[TrainState, dict[str, jax.Array]]:
+
+    traj_batch, memories_batch, advantages, targets = batch_info
+
+    grad_fn = jax.value_and_grad(
+        functools.partial(_loss_fn, network=network, config=config), has_aux=True
+    )
+    total_loss, grads = grad_fn(
+        train_state.params,
+        traj_batch,
+        memories_batch,
+        advantages,
+        targets,
+    )
+    train_state = train_state.apply_gradients(grads=grads)
+    return train_state, total_loss
+
+
+def _loss_fn(
+    params,
+    traj_batch: Transition,
+    memories_batch: Transition,
+    gae: jax.Array,
+    targets: jax.Array,
+    *,
+    network: ActorCriticTransformer,
+    config: dict[str, Any],
+):
+
+    # USE THE CACHED MEMORIES ONLY FROM THE FIRST STEP OF A WINDOW GRAD Because all other will be computed again here.
+    # construct the memory batch from memory indices
+    memories_batch = batch_indices_select(
+        memories_batch,
+        traj_batch.memories_indices[:, :: config["WINDOW_GRAD"]],
+    )
+    memories_batch = batchify(memories_batch)
+
+    # CREATE THE MASK FOR WINDOW GRAD (have to take the one from the batch and roll them to match the steps it attends
+    memories_mask = traj_batch.memories_mask.reshape(
+        (
+            -1,
+            config["WINDOW_GRAD"],
+        )
+        + traj_batch.memories_mask.shape[2:]
+    )
+    memories_mask = jnp.swapaxes(memories_mask, 1, 2)
+    # concatenate with 0s to fill before the roll
+    memories_mask = jnp.concatenate(
+        (
             memories_mask,
-            memories_mask_idx,
-            obsv,
-            done,
-            0,
-            _rng,
-        )
-        runner_state, metric = jax.lax.scan(
-            _update_step, runner_state, None, config["NUM_UPDATES"]
-        )
-        return {"runner_state": runner_state, "metrics": metric}
+            jnp.zeros(
+                memories_mask.shape[:-1] + (config["WINDOW_GRAD"] - 1,),
+                dtype=jnp.bool_,
+            ),
+        ),
+        axis=-1,
+    )
+    # roll of different value for each step to match the right
+    memories_mask = roll_vmap(memories_mask, jnp.arange(0, config["WINDOW_GRAD"]), -1)
 
-    return train
+    # RESHAPE
+    obs = traj_batch.obs
+    obs = obs.reshape(
+        (
+            -1,
+            config["WINDOW_GRAD"],
+        )
+        + obs.shape[2:]
+    )
+
+    traj_batch, targets, gae = jax.tree_util.tree_map(
+        lambda x: jnp.reshape(x, (-1, config["WINDOW_GRAD"]) + x.shape[2:]),
+        (traj_batch, targets, gae),
+    )
+
+    # NETWORK OUTPUT
+    pi, value = network.apply(
+        params,
+        memories_batch,
+        obs,
+        memories_mask,
+        method=network.model_forward_train,
+    )
+
+    log_prob = pi.log_prob(traj_batch.action)
+
+    # CALCULATE VALUE LOSS
+    value_pred_clipped = traj_batch.value + (value - traj_batch.value).clip(
+        -config["CLIP_EPS"], config["CLIP_EPS"]
+    )
+    value_losses = jnp.square(value - targets)
+    value_losses_clipped = jnp.square(value_pred_clipped - targets)
+    value_loss = 0.5 * jnp.maximum(value_losses, value_losses_clipped).mean()
+
+    # CALCULATE ACTOR LOSS
+    ratio = jnp.exp(log_prob - traj_batch.log_prob)
+    gae = (gae - gae.mean()) / (gae.std() + 1e-8)
+    loss_actor1 = ratio * gae
+    loss_actor2 = (
+        jnp.clip(
+            ratio,
+            1.0 - config["CLIP_EPS"],
+            1.0 + config["CLIP_EPS"],
+        )
+        * gae
+    )
+    loss_actor = -jnp.minimum(loss_actor1, loss_actor2)
+    loss_actor = loss_actor.mean()
+    entropy = pi.entropy().mean()
+
+    total_loss = (
+        loss_actor + config["VF_COEF"] * value_loss - config["ENT_COEF"] * entropy
+    )
+    return total_loss, (value_loss, loss_actor, entropy)
+
+
+def _calculate_gae(traj_batch, last_val, config: dict[str, Any]):
+    def _get_advantages(gae_and_next_value, transition):
+        gae, next_value = gae_and_next_value
+        done, value, reward = (
+            transition.done,
+            transition.value,
+            transition.reward,
+        )
+        delta = reward + config["GAMMA"] * next_value * (1 - done) - value
+        gae = delta + config["GAMMA"] * config["GAE_LAMBDA"] * (1 - done) * gae
+        return (gae, value), gae
+
+    _, advantages = jax.lax.scan(
+        _get_advantages,
+        (jnp.zeros_like(last_val), last_val),
+        traj_batch,
+        reverse=True,
+        unroll=16,
+    )
+    return advantages, advantages + traj_batch.value
