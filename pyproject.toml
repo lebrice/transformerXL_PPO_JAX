@@ -18,4 +18,5 @@ dependencies = [
     "optax>=0.2.6",
     "orbax-checkpoint>=0.11.33",
     "seaborn>=0.13.2",
+    "simple-parsing>=0.1.8",
 ]

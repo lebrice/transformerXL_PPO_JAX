@@ -1,0 +1,9 @@
+__pycache__/
+.venv
+wandb
+logs
+.vscode/*.json
+.python-version
+ignore
+uv.lock
+results_*
