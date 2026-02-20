@@ -1,4 +1,7 @@
 import functools
+import os
+import time
+from dataclasses import dataclass
 from typing import Any, NamedTuple, Sequence
 
 import distrax
@@ -21,6 +24,107 @@ from wrappers import (
     LogWrapper,
     OptimisticResetVecEnvWrapper,
 )
+
+
+@dataclass(frozen=True)
+class Config:
+    LR: float = 2e-4
+    NUM_ENVS: int = 512
+    NUM_STEPS: int = 128
+    TOTAL_TIMESTEPS: int = int(1e7)
+    UPDATE_EPOCHS: int = 4
+    NUM_MINIBATCHES: int = 8
+    GAMMA: float = 0.99
+    GAE_LAMBDA: float = 0.8
+    CLIP_EPS: float = 0.2
+    ENT_COEF: float = 0.01
+    VF_COEF: float = 0.5
+    MAX_GRAD_NORM: float = 1.0
+    ACTIVATION: str = "relu"
+    ENV_NAME: str = "MemoryChain-bsuite"
+    ANNEAL_LR: bool = True
+    qkv_features: int = 256
+    EMBED_SIZE: int = 256
+    num_heads: int = 8
+    num_layers: int = 2
+    hidden_layers: int = 256
+    WINDOW_MEM: int = 128
+    WINDOW_GRAD: int = 64
+    gating: bool = True
+    gating_bias: float = 2.0
+    seed: int = 0
+
+    # Set dynamically:
+    NUM_UPDATES: int = 0
+    MINIBATCH_SIZE: int = 0
+
+
+# todo: maybe use Hydra for configs for different envs.
+
+
+def main(config: Config | None = None):
+
+    config = config or Config(
+        LR=2e-4,
+        NUM_ENVS=512,
+        NUM_STEPS=128,
+        TOTAL_TIMESTEPS=int(1e7),
+        UPDATE_EPOCHS=4,
+        NUM_MINIBATCHES=8,
+        GAMMA=0.99,
+        GAE_LAMBDA=0.8,
+        CLIP_EPS=0.2,
+        ENT_COEF=0.01,
+        VF_COEF=0.5,
+        MAX_GRAD_NORM=1.0,
+        ACTIVATION="relu",
+        ENV_NAME="MemoryChain-bsuite",
+        ANNEAL_LR=True,
+        qkv_features=256,
+        EMBED_SIZE=256,
+        num_heads=8,
+        num_layers=2,
+        hidden_layers=256,
+        WINDOW_MEM=128,
+        WINDOW_GRAD=64,
+        gating=True,
+        gating_bias=2.0,
+        seed=0,
+    )
+
+    seed = config.seed
+
+    prefix = "results_gymnax/" + config.ENV_NAME
+
+    try:
+        if not os.path.exists(prefix):
+            os.makedirs(prefix)
+    except IOError:
+        print("directory creation " + prefix + " failed")
+
+    print("Start compiling and training")
+    t = time.time()
+    rng = jax.random.PRNGKey(seed)
+    train_fn = make_train(config)
+    train_fn = jax.jit(train_fn).lower(rng).compile()
+    print(f"Jit compilation took {time.time() - t} seconds")
+    t = time.time()
+    out = train_fn(rng)
+    print(f"Training took {time.time() - t} seconds")
+
+    import matplotlib.pyplot as plt
+
+    plt.plot(out["metrics"]["returned_episode_returns"])
+    plt.xlabel("Updates")
+    plt.ylabel("Return")
+    plt.savefig(prefix + "/return_" + str(seed))
+
+    plt.clf()
+
+    jnp.save(prefix + "/" + str(seed) + "_params", out["runner_state"][0].params)
+    jnp.save(prefix + "/" + str(seed) + "_config", config)
+
+    jnp.save(prefix + "/" + str(seed) + "_metrics", out["metrics"])
 
 
 class ActorCriticTransformer(nn.Module):
@@ -149,8 +253,7 @@ class Transition(NamedTuple):
     info: jnp.ndarray
 
 
-indices_select = lambda x, y: x[y]
-batch_indices_select = jax.vmap(indices_select)
+batch_indices_select = jax.vmap(lambda x, y: x[y])
 roll_vmap = jax.vmap(jnp.roll, in_axes=(-2, 0, None), out_axes=-2)
 
 
@@ -170,16 +273,12 @@ def linear_schedule(
     return lr * frac
 
 
-def make_train(config: dict[str, Any]):
+def make_train(config: Config):
 
-    config["NUM_UPDATES"] = (
-        config["TOTAL_TIMESTEPS"] // config["NUM_STEPS"] // config["NUM_ENVS"]
-    )
-    config["MINIBATCH_SIZE"] = (
-        config["NUM_ENVS"] * config["NUM_STEPS"] // config["NUM_MINIBATCHES"]
-    )
+    config.NUM_UPDATES = config.TOTAL_TIMESTEPS // config.NUM_STEPS // config.NUM_ENVS
+    config.MINIBATCH_SIZE = config.NUM_ENVS * config.NUM_STEPS // config.NUM_MINIBATCHES
 
-    if config["ENV_NAME"] == "craftax":
+    if config.ENV_NAME == "craftax":
         from craftax.craftax.envs.craftax_symbolic_env import (
             CraftaxSymbolicEnvNoAutoReset,
         )
@@ -189,14 +288,14 @@ def make_train(config: dict[str, Any]):
         env = LogWrapper(env)
         env = OptimisticResetVecEnvWrapper(
             env,
-            num_envs=config["NUM_ENVS"],
-            reset_ratio=min(16, config["NUM_ENVS"]),
+            num_envs=config.NUM_ENVS,
+            reset_ratio=min(16, config.NUM_ENVS),
         )
     else:
-        env, env_params = gymnax.make(config["ENV_NAME"])
+        env, env_params = gymnax.make(config.ENV_NAME)
         env = FlattenObservationWrapper(env)
         env = LogWrapper(env)
-        env = BatchEnvWrapper(env, config["NUM_ENVS"])
+        env = BatchEnvWrapper(env, config.NUM_ENVS)
 
     return lambda rng: train(
         rng,
@@ -206,47 +305,47 @@ def make_train(config: dict[str, Any]):
     )
 
 
-def train(rng: jax.Array, env: Environment, env_params: EnvParams, config: dict):
+def train(rng: jax.Array, env: Environment, env_params: EnvParams, config: Config):
     # INIT NETWORK
     network = ActorCriticTransformer(
         action_dim=env.action_space(env_params).n,
-        activation=config["ACTIVATION"],
-        encoder_size=config["EMBED_SIZE"],
-        hidden_layers=config["hidden_layers"],
-        num_heads=config["num_heads"],
-        qkv_features=config["qkv_features"],
-        num_layers=config["num_layers"],
-        gating=config["gating"],
-        gating_bias=config["gating_bias"],
+        activation=config.ACTIVATION,
+        encoder_size=config.EMBED_SIZE,
+        hidden_layers=config.hidden_layers,
+        num_heads=config.num_heads,
+        qkv_features=config.qkv_features,
+        num_layers=config.num_layers,
+        gating=config.gating,
+        gating_bias=config.gating_bias,
     )
     rng, _rng = jax.random.split(rng)
     init_obs = jnp.zeros((2, env.observation_space(env_params).shape[0]))
     init_memory = jnp.zeros(
-        (2, config["WINDOW_MEM"], config["num_layers"], config["EMBED_SIZE"])
+        (2, config.WINDOW_MEM, config.num_layers, config.EMBED_SIZE)
     )
     init_mask = jnp.zeros(
-        (2, config["num_heads"], 1, config["WINDOW_MEM"] + 1), dtype=jnp.bool_
+        (2, config.num_heads, 1, config.WINDOW_MEM + 1), dtype=jnp.bool_
     )
     network_params = network.init(_rng, init_memory, init_obs, init_mask)
 
-    if config["ANNEAL_LR"]:
+    if config.ANNEAL_LR:
         tx = optax.chain(
-            optax.clip_by_global_norm(config["MAX_GRAD_NORM"]),
+            optax.clip_by_global_norm(config.MAX_GRAD_NORM),
             optax.adam(
                 learning_rate=lambda count: linear_schedule(
                     count,
-                    num_minibatches=config["NUM_MINIBATCHES"],
-                    update_epochs=config["UPDATE_EPOCHS"],
-                    num_updates=config["NUM_UPDATES"],
-                    lr=config["LR"],
+                    num_minibatches=config.NUM_MINIBATCHES,
+                    update_epochs=config.UPDATE_EPOCHS,
+                    num_updates=config.NUM_UPDATES,
+                    lr=config.LR,
                 ),
                 eps=1e-5,
             ),
         )
     else:
         tx = optax.chain(
-            optax.clip_by_global_norm(config["MAX_GRAD_NORM"]),
-            optax.adam(config["LR"], eps=1e-5),
+            optax.clip_by_global_norm(config.MAX_GRAD_NORM),
+            optax.adam(config.LR, eps=1e-5),
         )
 
     train_state = TrainState.create(
@@ -258,7 +357,7 @@ def train(rng: jax.Array, env: Environment, env_params: EnvParams, config: dict)
     # Reset ENV
     rng, _rng = jax.random.split(rng)
     obsv, env_state = env.reset(_rng, env_params)
-    # reset_rng = jax.random.split(_rng, config["NUM_ENVS"])
+    # reset_rng = jax.random.split(_rng, config.NUM_ENVS)
     # obsv, env_state = jax.vmap(env.reset, in_axes=(0, None))(reset_rng, env_params)
 
     # TRAIN LOOP
@@ -267,21 +366,21 @@ def train(rng: jax.Array, env: Environment, env_params: EnvParams, config: dict)
     rng, _rng = jax.random.split(rng)
     memories = jnp.zeros(
         (
-            config["NUM_ENVS"],
-            config["WINDOW_MEM"],
-            config["num_layers"],
-            config["EMBED_SIZE"],
+            config.NUM_ENVS,
+            config.WINDOW_MEM,
+            config.num_layers,
+            config.EMBED_SIZE,
         )
     )
     memories_mask = jnp.zeros(
-        (config["NUM_ENVS"], config["num_heads"], 1, config["WINDOW_MEM"] + 1),
+        (config.NUM_ENVS, config.num_heads, 1, config.WINDOW_MEM + 1),
         dtype=jnp.bool_,
     )
     # memories +1 bc will remove one
-    memories_mask_idx = jnp.zeros((config["NUM_ENVS"],), dtype=jnp.int32) + (
-        config["WINDOW_MEM"] + 1
+    memories_mask_idx = jnp.zeros((config.NUM_ENVS,), dtype=jnp.int32) + (
+        config.WINDOW_MEM + 1
     )
-    done = jnp.zeros((config["NUM_ENVS"],), dtype=jnp.bool_)
+    done = jnp.zeros((config.NUM_ENVS,), dtype=jnp.bool_)
 
     runner_state = RunnerState(
         train_state,
@@ -305,8 +404,8 @@ def train(rng: jax.Array, env: Environment, env_params: EnvParams, config: dict)
             config=config,
         ),
         init=runner_state,
-        xs=jnp.arange(config["NUM_UPDATES"]),  # was None, doesn't hurt to pass it.
-        length=config["NUM_UPDATES"],
+        xs=jnp.arange(config.NUM_UPDATES),  # was None, doesn't hurt to pass it.
+        length=config.NUM_UPDATES,
     )
     return {"runner_state": runner_state, "metrics": metric}
 
@@ -355,17 +454,17 @@ def _env_step(
     # reset memories mask and mask idx in cask of done otherwise mask will consider one more stepif not filled (if filled=
     memories_mask_idx = jnp.where(
         done,
-        config["WINDOW_MEM"],
-        jnp.clip(memories_mask_idx - 1, 0, config["WINDOW_MEM"]),
+        config.WINDOW_MEM,
+        jnp.clip(memories_mask_idx - 1, 0, config.WINDOW_MEM),
     )
     memories_mask = jnp.where(
         done[:, None, None, None],
         jnp.zeros(
             (
-                config["NUM_ENVS"],
-                config["num_heads"],
+                config.NUM_ENVS,
+                config.num_heads,
                 1,
-                config["WINDOW_MEM"] + 1,
+                config.WINDOW_MEM + 1,
             ),
             dtype=jnp.bool_,
         ),
@@ -373,9 +472,9 @@ def _env_step(
     )
 
     # Update memories mask with the potential additional step taken into account at this step
-    memories_mask_idx_ohot = jax.nn.one_hot(memories_mask_idx, config["WINDOW_MEM"] + 1)
+    memories_mask_idx_ohot = jax.nn.one_hot(memories_mask_idx, config.WINDOW_MEM + 1)
     memories_mask_idx_ohot = memories_mask_idx_ohot[:, None, None, :].repeat(
-        config["num_heads"], 1
+        config.num_heads, 1
     )
     assert isinstance(memories_mask, jax.Array)
     memories_mask = jnp.logical_or(memories_mask, memories_mask_idx_ohot)
@@ -397,7 +496,7 @@ def _env_step(
 
     # STEP ENV
     rng, _rng = jax.random.split(rng)
-    # rng_step = jax.random.split(_rng, config["NUM_ENVS"])
+    # rng_step = jax.random.split(_rng, config.NUM_ENVS)
     # obsv, env_state, reward, done, info = jax.vmap(env.step, in_axes=(0,0,0,None))(
     #    rng_step, env_state, action, env_params
     # )
@@ -406,9 +505,9 @@ def _env_step(
     # COMPUTE THE INDICES OF THE FINAL MEMORIES THAT ARE TAKEN INTO ACCOUNT IN THIS STEP
     # not forgeeting that we will concatenate the previous WINDOW_MEM to the NUM_STEPS so that even the first step will use some cached memory.
     # previous without this is attend to 0 which are masked but with reset happening if we start the num_steps loop during good to keep memory from previous
-    memory_indices = jnp.arange(0, config["WINDOW_MEM"])[
+    memory_indices = jnp.arange(0, config.WINDOW_MEM)[
         None, :
-    ] + step_env_currentloop * jnp.ones((config["NUM_ENVS"], 1), dtype=jnp.int32)
+    ] + step_env_currentloop * jnp.ones((config.NUM_ENVS, 1), dtype=jnp.int32)
     assert isinstance(value, jax.Array)
     transition = Transition(
         done,
@@ -461,8 +560,8 @@ def _update_step(
             config=config,
         ),
         init=runner_state,
-        xs=jnp.arange(config["NUM_STEPS"]),
-        length=config["NUM_STEPS"],
+        xs=jnp.arange(config.NUM_STEPS),
+        length=config.NUM_STEPS,
     )
 
     # CALCULATE ADVANTAGE
@@ -522,7 +621,7 @@ def _update_step(
         ),
         update_state,
         None,
-        config["UPDATE_EPOCHS"],
+        config.UPDATE_EPOCHS,
     )
     train_state = update_state[0]
     rng = update_state[-1]
@@ -549,13 +648,13 @@ def _update_epoch(
 ) -> tuple[UpdateState, dict[str, jax.Array]]:
     train_state, traj_batch, memories_batch, advantages, targets, rng = update_state
     rng, _rng = jax.random.split(rng)
-    # batch_size = config["MINIBATCH_SIZE"] * config["NUM_MINIBATCHES"]
-    assert config["NUM_STEPS"] % config["WINDOW_GRAD"] == 0, (
+    # batch_size = config.MINIBATCH_SIZE * config.NUM_MINIBATCHES
+    assert config.NUM_STEPS % config.WINDOW_GRAD == 0, (
         "NUM_STEPS should be divi by WINDOW_GRAD to properly batch the window_grad"
     )
 
     # PERMUTE ALONG THE NUM_ENVS ONLY NOT TO LOOSE TRACK FROM TEMPORAL
-    permutation = jax.random.permutation(_rng, config["NUM_ENVS"])
+    permutation = jax.random.permutation(_rng, config.NUM_ENVS)
     batch = (traj_batch, memories_batch, advantages, targets)
     batch = jax.tree_util.tree_map(
         lambda x: jnp.swapaxes(x, 0, 1),
@@ -567,7 +666,7 @@ def _update_epoch(
 
     # either create memory batch here but might be big  or send all the memeory to loss and do the things with the index in the loss
     minibatches = jax.tree_util.tree_map(
-        lambda x: jnp.reshape(x, [config["NUM_MINIBATCHES"], -1] + list(x.shape[1:])),
+        lambda x: jnp.reshape(x, [config.NUM_MINIBATCHES, -1] + list(x.shape[1:])),
         shuffled_batch,
     )
 
@@ -632,7 +731,7 @@ def _loss_fn(
     # construct the memory batch from memory indices
     memories_batch = batch_indices_select(
         memories_batch,
-        traj_batch.memories_indices[:, :: config["WINDOW_GRAD"]],
+        traj_batch.memories_indices[:, :: config.WINDOW_GRAD],
     )
     memories_batch = batchify(memories_batch)
 
@@ -640,7 +739,7 @@ def _loss_fn(
     memories_mask = traj_batch.memories_mask.reshape(
         (
             -1,
-            config["WINDOW_GRAD"],
+            config.WINDOW_GRAD,
         )
         + traj_batch.memories_mask.shape[2:]
     )
@@ -650,27 +749,27 @@ def _loss_fn(
         (
             memories_mask,
             jnp.zeros(
-                memories_mask.shape[:-1] + (config["WINDOW_GRAD"] - 1,),
+                memories_mask.shape[:-1] + (config.WINDOW_GRAD - 1,),
                 dtype=jnp.bool_,
             ),
         ),
         axis=-1,
     )
     # roll of different value for each step to match the right
-    memories_mask = roll_vmap(memories_mask, jnp.arange(0, config["WINDOW_GRAD"]), -1)
+    memories_mask = roll_vmap(memories_mask, jnp.arange(0, config.WINDOW_GRAD), -1)
 
     # RESHAPE
     obs = traj_batch.obs
     obs = obs.reshape(
         (
             -1,
-            config["WINDOW_GRAD"],
+            config.WINDOW_GRAD,
         )
         + obs.shape[2:]
     )
 
     traj_batch, targets, gae = jax.tree_util.tree_map(
-        lambda x: jnp.reshape(x, (-1, config["WINDOW_GRAD"]) + x.shape[2:]),
+        lambda x: jnp.reshape(x, (-1, config.WINDOW_GRAD) + x.shape[2:]),
         (traj_batch, targets, gae),
     )
 
@@ -687,7 +786,7 @@ def _loss_fn(
 
     # CALCULATE VALUE LOSS
     value_pred_clipped = traj_batch.value + (value - traj_batch.value).clip(
-        -config["CLIP_EPS"], config["CLIP_EPS"]
+        -config.CLIP_EPS, config.CLIP_EPS
     )
     value_losses = jnp.square(value - targets)
     value_losses_clipped = jnp.square(value_pred_clipped - targets)
@@ -700,8 +799,8 @@ def _loss_fn(
     loss_actor2 = (
         jnp.clip(
             ratio,
-            1.0 - config["CLIP_EPS"],
-            1.0 + config["CLIP_EPS"],
+            1.0 - config.CLIP_EPS,
+            1.0 + config.CLIP_EPS,
         )
         * gae
     )
@@ -709,9 +808,7 @@ def _loss_fn(
     loss_actor = loss_actor.mean()
     entropy = pi.entropy().mean()
 
-    total_loss = (
-        loss_actor + config["VF_COEF"] * value_loss - config["ENT_COEF"] * entropy
-    )
+    total_loss = loss_actor + config.VF_COEF * value_loss - config.ENT_COEF * entropy
     return total_loss, (value_loss, loss_actor, entropy)
 
 
@@ -723,8 +820,8 @@ def _calculate_gae(traj_batch, last_val, config: dict[str, Any]):
             transition.value,
             transition.reward,
         )
-        delta = reward + config["GAMMA"] * next_value * (1 - done) - value
-        gae = delta + config["GAMMA"] * config["GAE_LAMBDA"] * (1 - done) * gae
+        delta = reward + config.GAMMA * next_value * (1 - done) - value
+        gae = delta + config.GAMMA * config.GAE_LAMBDA * (1 - done) * gae
         return (gae, value), gae
 
     _, advantages = jax.lax.scan(
@@ -735,3 +832,7 @@ def _calculate_gae(traj_batch, last_val, config: dict[str, Any]):
         unroll=16,
     )
     return advantages, advantages + traj_batch.value
+
+
+if __name__ == "__main__":
+    main()
