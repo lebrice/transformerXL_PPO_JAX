@@ -9,7 +9,7 @@ from flax import struct
 # Taken from https://github.com/MichaelTMatthews/Craftax_Baselines/blob/main/wrappers.py
 
 
-class GymnaxWrapper(object):
+class GymnaxWrapper:
     """Base class for Gymnax wrappers."""
 
     def __init__(self, env):
@@ -59,7 +59,6 @@ class AutoResetEnvWrapper(GymnaxWrapper):
 
     @partial(jax.jit, static_argnums=(0, 4))
     def step(self, rng, state, action, params=None):
-
         rng, _rng = jax.random.split(rng)
         obs_st, state_st, reward, done, info = self._env.step(
             _rng, state, action, params
@@ -112,7 +111,6 @@ class OptimisticResetVecEnvWrapper(GymnaxWrapper):
 
     @partial(jax.jit, static_argnums=(0, 4))
     def step(self, rng, state, action, params=None):
-
         rng, _rng = jax.random.split(rng)
         rngs = jax.random.split(_rng, self.num_envs)
         obs_st, state_st, reward, done, info = self.step_fn(rngs, state, action, params)

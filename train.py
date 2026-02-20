@@ -1,8 +1,12 @@
+from __future__ import annotations
+
+import dataclasses
 import functools
 import os
 import time
+import typing
 from dataclasses import dataclass
-from typing import Any, NamedTuple, Sequence
+from typing import Callable, Concatenate, NamedTuple, Sequence
 
 import distrax
 import einops
@@ -24,6 +28,13 @@ from wrappers import (
     LogWrapper,
     OptimisticResetVecEnvWrapper,
 )
+
+if typing.TYPE_CHECKING:
+    from craftax.craftax.envs import craftax_symbolic_env
+    from jax._src.api import AxisName
+
+
+type TEnvParams = EnvParams | craftax_symbolic_env.EnvParams
 
 
 @dataclass(frozen=True)
@@ -63,7 +74,6 @@ class Config:
 
 
 def main(config: Config | None = None):
-
     config = config or Config(
         LR=2e-4,
         NUM_ENVS=512,
@@ -122,7 +132,7 @@ def main(config: Config | None = None):
     plt.clf()
 
     jnp.save(prefix + "/" + str(seed) + "_params", out["runner_state"][0].params)
-    jnp.save(prefix + "/" + str(seed) + "_config", config)
+    jnp.save(prefix + "/" + str(seed) + "_config", dataclasses.asdict(config))  # type: ignore
 
     jnp.save(prefix + "/" + str(seed) + "_metrics", out["metrics"])
 
@@ -139,7 +149,6 @@ class ActorCriticTransformer(nn.Module):
     gating_bias: float = 0.0
 
     def setup(self):
-
         # USE SETUP AND DIFFERENT FUNCTIONS BECAUSE THE TRAIN IS DIFFERENT FROM EVAL ( as we query just one step in train and don't cache memory in eval)
 
         if self.activation == "relu":
@@ -166,6 +175,9 @@ class ActorCriticTransformer(nn.Module):
             kernel_init=orthogonal(np.sqrt(2)),
             bias_init=constant(0.0),
         )
+        assert isinstance(
+            self.action_dim, int
+        )  # todo: fix the attribute annotation or ignore.
         self.actor_out = nn.Dense(
             self.action_dim, kernel_init=orthogonal(0.01), bias_init=constant(0.0)
         )
@@ -184,8 +196,7 @@ class ActorCriticTransformer(nn.Module):
             1, kernel_init=orthogonal(1.0), bias_init=constant(0.0)
         )
 
-    def __call__(self, memories, obs, mask):
-
+    def __call__(self, memories, obs: jax.Array, mask: jax.Array):
         x, memory_out = self.transformer(memories, obs, mask)
 
         actor_mean = self.actor_ln1(x)
@@ -242,15 +253,15 @@ class ActorCriticTransformer(nn.Module):
 
 
 class Transition(NamedTuple):
-    done: jnp.ndarray
-    action: jnp.ndarray
-    value: jnp.ndarray
-    reward: jnp.ndarray
-    log_prob: jnp.ndarray
-    memories_mask: jnp.ndarray
-    memories_indices: jnp.ndarray
-    obs: jnp.ndarray
-    info: jnp.ndarray
+    done: jax.Array
+    action: jax.Array
+    value: jax.Array
+    reward: jax.Array
+    log_prob: jax.Array
+    memories_mask: jax.Array
+    memories_indices: jax.Array
+    obs: jax.Array
+    info: jax.Array
 
 
 batch_indices_select = jax.vmap(lambda x, y: x[y])
@@ -274,9 +285,13 @@ def linear_schedule(
 
 
 def make_train(config: Config):
-
-    config.NUM_UPDATES = config.TOTAL_TIMESTEPS // config.NUM_STEPS // config.NUM_ENVS
-    config.MINIBATCH_SIZE = config.NUM_ENVS * config.NUM_STEPS // config.NUM_MINIBATCHES
+    config = dataclasses.replace(
+        config,
+        NUM_UPDATES=config.TOTAL_TIMESTEPS // config.NUM_STEPS // config.NUM_ENVS,
+        MINIBATCH_SIZE=config.NUM_ENVS * config.NUM_STEPS // config.NUM_MINIBATCHES,
+    )
+    # config.NUM_UPDATES = config.TOTAL_TIMESTEPS // config.NUM_STEPS // config.NUM_ENVS
+    # config.MINIBATCH_SIZE = config.NUM_ENVS * config.NUM_STEPS // config.NUM_MINIBATCHES
 
     if config.ENV_NAME == "craftax":
         from craftax.craftax.envs.craftax_symbolic_env import (
@@ -299,13 +314,18 @@ def make_train(config: Config):
 
     return lambda rng: train(
         rng,
-        env=env,
+        env=env,  # type: ignore
         env_params=env_params,
         config=config,
     )
 
 
-def train(rng: jax.Array, env: Environment, env_params: EnvParams, config: Config):
+def train(
+    rng: jax.Array,
+    env: Environment,
+    env_params: EnvParams | craftax_symbolic_env.EnvParams,
+    config: Config,
+):
     # INIT NETWORK
     network = ActorCriticTransformer(
         action_dim=env.action_space(env_params).n,
@@ -418,7 +438,7 @@ class RunnerState(NamedTuple):
     memories_mask_idx: jax.Array  # num_envs
     obsv: jax.Array
     done: jax.Array
-    steps: jax.Array
+    steps: int | jax.Array
     rng: jax.Array
 
 
@@ -435,8 +455,8 @@ def _env_step(
     runner_state: RunnerState,
     _step_index: jax.Array,
     env: Environment,
-    env_params: EnvParams,
-    config: dict[str, Any],
+    env_params: TEnvParams,
+    config: Config,
     network: ActorCriticTransformer,
 ):
     (
@@ -481,15 +501,21 @@ def _env_step(
 
     # SELECT ACTION
     rng, _rng = jax.random.split(rng)
-    pi, value, memories_out = network.apply(
+    network_outputs = network.apply(
         train_state.params,
         memories,
         last_obs,
         memories_mask,
         method=network.model_forward_eval,
     )
+    assert len(network_outputs) == 3
+    pi, value, memories_out = network_outputs
+    assert isinstance(pi, distrax.Categorical)
+    assert isinstance(value, jax.Array)
+    assert isinstance(memories_out, jax.Array)
     action = pi.sample(seed=_rng)
     log_prob = pi.log_prob(action)
+    assert isinstance(log_prob, jax.Array)
 
     # ADD THE CACHED ACTIVATIONS IN MEMORIES FOR NEXT STEP
     memories = jnp.roll(memories, -1, axis=1).at[:, -1].set(memories_out)
@@ -542,8 +568,8 @@ def _update_step(
     memories_mask: jax.Array,
     network: ActorCriticTransformer,
     env: Environment,
-    env_params: EnvParams,
-    config: dict[str, Any],
+    env_params: TEnvParams,
+    config: Config,
 ) -> tuple[RunnerState, dict[str, jax.Array]]:
     # COLLECT TRAJECTORIES
     # also copy the first memories in memories_previous before the new rollout to concatenate previous memories with new steps so that first steps of new have memories
@@ -576,13 +602,16 @@ def _update_step(
         _,
         rng,
     ) = runner_state
-    _, last_val, _ = network.apply(
+    outputs = network.apply(
         train_state.params,
         memories,
         last_obs,
         memories_mask,
         method=network.model_forward_eval,
     )
+    assert len(outputs) == 3
+    _, last_val, _ = outputs
+    assert isinstance(last_val, jax.Array)
 
     advantages, targets = _calculate_gae(traj_batch, last_val, config=config)
 
@@ -619,9 +648,9 @@ def _update_step(
             network=network,
             config=config,
         ),
-        update_state,
-        None,
-        config.UPDATE_EPOCHS,
+        init=update_state,
+        xs=jnp.arange(config.UPDATE_EPOCHS),
+        length=config.UPDATE_EPOCHS,
     )
     train_state = update_state[0]
     rng = update_state[-1]
@@ -644,7 +673,7 @@ def _update_epoch(
     _index: jax.Array,
     *,
     network: ActorCriticTransformer,
-    config: dict[str, Any],
+    config: Config,
 ) -> tuple[UpdateState, dict[str, jax.Array]]:
     train_state, traj_batch, memories_batch, advantages, targets, rng = update_state
     rng, _rng = jax.random.split(rng)
@@ -697,9 +726,8 @@ def _update_minbatch(
     batch_info: tuple[Transition, jax.Array, jax.Array, jax.Array],
     *,
     network: ActorCriticTransformer,
-    config: dict[str, Any],
+    config: Config,
 ) -> tuple[TrainState, dict[str, jax.Array]]:
-
     traj_batch, memories_batch, advantages, targets = batch_info
 
     grad_fn = jax.value_and_grad(
@@ -716,17 +744,34 @@ def _update_minbatch(
     return train_state, total_loss
 
 
+def value_and_grad[**P, Params, Out](
+    fun: Callable[Concatenate[Params, P], Out],
+    argnums: int | Sequence[int] = 0,
+    has_aux: bool = False,
+    holomorphic: bool = False,
+    allow_int: bool = False,
+    reduce_axes: Sequence[AxisName] = (),
+) -> Callable[P, tuple[Out, Params]]:
+    return jax.value_and_grad(
+        fun,
+        argnums=argnums,
+        has_aux=has_aux,
+        holomorphic=holomorphic,
+        allow_int=allow_int,
+        reduce_axes=reduce_axes,
+    )
+
+
 def _loss_fn(
     params,
     traj_batch: Transition,
-    memories_batch: Transition,
+    memories_batch: jax.Array,  # todo; unclear what the type of this is.
     gae: jax.Array,
     targets: jax.Array,
     *,
     network: ActorCriticTransformer,
-    config: dict[str, Any],
+    config: Config,
 ):
-
     # USE THE CACHED MEMORIES ONLY FROM THE FIRST STEP OF A WINDOW GRAD Because all other will be computed again here.
     # construct the memory batch from memory indices
     memories_batch = batch_indices_select(
@@ -781,6 +826,8 @@ def _loss_fn(
         memories_mask,
         method=network.model_forward_train,
     )
+    assert isinstance(pi, distrax.Categorical)
+    assert isinstance(value, jax.Array)
 
     log_prob = pi.log_prob(traj_batch.action)
 
@@ -812,7 +859,7 @@ def _loss_fn(
     return total_loss, (value_loss, loss_actor, entropy)
 
 
-def _calculate_gae(traj_batch, last_val, config: dict[str, Any]):
+def _calculate_gae(traj_batch, last_val, config: Config):
     def _get_advantages(gae_and_next_value, transition):
         gae, next_value = gae_and_next_value
         done, value, reward = (
