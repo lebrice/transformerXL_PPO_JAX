@@ -38,3 +38,29 @@ clusters = [
     "trillium",
     "trillium-gpu",
 ]
+
+# [tool.cluv.cluster.tamia]
+# gres = "gpu:h100:4"
+
+[tool.uv]
+index-strategy = "unsafe-first-match"
+
+[[tool.uv.index]]
+name = "drac-gentoo2023-x86-64-v3"
+url = "/cvmfs/soft.computecanada.ca/custom/python/wheelhouse/gentoo2023/x86-64-v3"
+format = "flat"
+
+[[tool.uv.index]]
+name = "drac-gentoo2023-generic"
+url = "/cvmfs/soft.computecanada.ca/custom/python/wheelhouse/gentoo2023/generic"
+format = "flat"
+
+[[tool.uv.index]]
+name = "drac-generic"
+url = "/cvmfs/soft.computecanada.ca/custom/python/wheelhouse/generic"
+format = "flat"
+
+[[tool.uv.index]]
+name = "pypi_secret"
+url = "https://www.pypi.org/simple"
+default = true
