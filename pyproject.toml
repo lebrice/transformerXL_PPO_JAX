@@ -6,6 +6,7 @@ readme = "README.md"
 requires-python = "~=3.13.0"
 dependencies = [
     "chex>=0.1.91",
+    "cluv",
     "craftax>=1.5.0",
     "distrax>=0.1.7",
     "einops>=0.8.2",
@@ -19,4 +20,21 @@ dependencies = [
     "orbax-checkpoint>=0.11.33",
     "seaborn>=0.13.2",
     "simple-parsing>=0.1.8",
+]
+
+[tool.uv.sources]
+cluv = { path = "../cluv", editable = true }
+
+[tool.cluv]
+clusters = [
+    "mila",
+    "tamia",
+    "narval",
+    "rorqual",
+    "fir",
+    # "nibi",  getting weird errors with nibi, (bash: line 1: git-receive-pack: command not found)
+    "killarney",
+    "vulcan",
+    "trillium",
+    "trillium-gpu",
 ]
