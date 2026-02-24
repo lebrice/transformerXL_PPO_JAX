@@ -1,9 +1,9 @@
 #!/bin/bash
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=4
-#SBATCH --gpus-per-task=1
+#SBATCH --gpus=1
 #SBATCH --mem-per-gpu=16G
-#SBATCH --time=02:59:00
+#SBATCH --time=01:00:00
 #SBATCH --output=logs/%j/out.txt
 #SBATCH --switches=1@600   # try to find a set of nodes on the same switch when doing multi-node.
 
