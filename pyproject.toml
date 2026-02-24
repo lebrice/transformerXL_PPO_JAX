@@ -23,7 +23,7 @@ dependencies = [
 ]
 
 [tool.uv.sources]
-cluv = { path = "../cluv", editable = true }
+# cluv = { path = "../cluv", editable = true }
 
 
 [dependency-groups]
@@ -44,7 +44,7 @@ clusters = [
     "trillium-gpu",
 ]
 # TODO: Make it possible to use a list of directories or a glob pattern.
-# results_path = "results_craftax"
+results_path = "logs"
 
 # [tool.cluv.cluster.tamia]
 # gres = "gpu:h100:4"

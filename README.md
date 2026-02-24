@@ -15,10 +15,26 @@ The training of a 5M transformer on craftax for 1e9 steps (with 1024 environment
 ```
 git clone git@github.com:Reytuag/transformerXL_PPO_JAX.git
 cd transformerXL_PPO_JAX
-pip install -r requirements.txt
+uv sync
 ```
 
-:warning: By default, this will install the cpu version of JAX. You can install the GPU version of JAX following https://jax.readthedocs.io/en/latest/installation.html.
+:warning: By default, this will install the cpu version of JAX. You can install the GPU version of JAX using either the `cuda12` or `cuda13` dependency group.
+
+```
+uv sync --group=cuda12
+```
+
+## Cluv example
+
+This repo is also used as a testbench for a new tool called `cluv`, being developed here at Mila.
+
+```
+cluv run rorqual --group=cuda12 python train.py
+```
+
+```
+cluv run tamia --group=cuda13 python train.py
+```
 
 ## Training 
 
