@@ -167,7 +167,10 @@ class Transition(NamedTuple):
 def main(argv: str | list[str] | None = None):
     argv = shlex.split(argv) if isinstance(argv, str) else argv or sys.argv
     config = simple_parsing.parse(
-        Config, default=CRAFTAX_CONFIG, add_config_path_arg=True, description=__doc__
+        Config,
+        default=MEMORYCHAIN_CONFIG,
+        add_config_path_arg=True,
+        description=__doc__,
     )
 
     seed = config.seed
