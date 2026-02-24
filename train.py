@@ -199,6 +199,7 @@ def main(argv: str | list[str] | None = None):
     print(f"Jit compilation took {time.time() - t} seconds")
     t = time.time()
     out = train_fn(rng)
+    out = jax.block_until_ready(out)
     print(f"Training took {time.time() - t} seconds")
 
     import matplotlib.pyplot as plt

@@ -13,7 +13,7 @@ dependencies = [
     "flax>=0.12.3",
     "gymnasium>=1.2.3",
     "gymnax>=0.0.8",
-    "jax[cuda12]>=0.8.2",
+    "jax>=0.8.2",
     "kiwisolver>=1.4.9",
     "matplotlib>=3.10.8",
     "optax>=0.2.6",
@@ -24,6 +24,11 @@ dependencies = [
 
 [tool.uv.sources]
 cluv = { path = "../cluv", editable = true }
+
+
+[dependency-groups]
+cuda12 = ["jax[cuda12]>=0.9.0.1"]
+cuda13 = ["jax[cuda13]>=0.9.0.1"]
 
 [tool.cluv]
 clusters = [
@@ -45,44 +50,4 @@ clusters = [
 # gres = "gpu:h100:4"
 
 [tool.uv]
-#python-preference = "system"
-
-# ## From https://docs.astral.sh/uv/reference/settings/#index-strategy:
-# ## "Only use results from the first index that returns a match for a given package name."
-# ## In other words: only get the package from PyPI if there isn't a version of it in the DRAC wheelhouse.
-#index-strategy = "first-index"
-
-# ## "Search for every package name across all indexes, exhausting the versions from the first index before
-# ##  moving on to the next"
-# ## In other words: Only get the package from PyPI if the requested version is higher than the version
-# ## in the DRAC wheelhouse.
-#index-strategy = "unsafe-first-match"
-
-# ## "Search for every package name across all indexes, preferring the "best" version found.
-# ##  If a package version is in multiple indexes, only look at the entry for the first index."
-# ## In other words: Consider all versions of the package DRAC + PyPI, and use the version that best matches
-# ## the requested version. In a tie, choose the DRAC wheel.
-#index-strategy = "unsafe-best-match"
-
-#[[tool.uv.index]]
-#name = "drac-gentoo2023-x86-64-v3"
-#url = "/cvmfs/soft.computecanada.ca/custom/python/wheelhouse/gentoo2023/x86-64-v3"
-#format = "flat"
-#
-#[[tool.uv.index]]
-#name = "drac-gentoo2023-generic"
-#url = "/cvmfs/soft.computecanada.ca/custom/python/wheelhouse/gentoo2023/generic"
-#format = "flat"
-#
-#[[tool.uv.index]]
-#name = "drac-generic"
-#url = "/cvmfs/soft.computecanada.ca/custom/python/wheelhouse/generic"
-#format = "flat"
-##default = true
-#
-#[[tool.uv.index]]
-#name = "pypi_secret"
-#url = "https://www.pypi.org/simple"
-#default = true
-#
-
+conflicts = [[{ group = "cuda12" }, { group = "cuda13" }]]
