@@ -30,7 +30,8 @@ cuda13 = ["jax[cuda13]>=0.9.0.1"]
 [tool.uv]
 conflicts = [[{ group = "cuda12" }, { group = "cuda13" }]]
 
-default-groups = ["cuda13"]
+# TODO: Would it be better to setup a default group that works on most clusters?
+default-groups = ["cuda12"]
 
 
 [tool.uv.sources]
@@ -50,6 +51,10 @@ clusters = [
     "trillium-gpu",
 ]
 # TODO: Make it possible to use a list of directories or a glob pattern.
+# TODO: If we want checkpoints to be stored in a file relative to the project root,
+# then we need to adapt the code to recreate this symlink when the jobs start, because if we 
+# use safe_sbatch + the code_checkpointing script, the repo is cloned in $SLURM_TMPDIR, and if
+# the logs are saved in that directory using a relative path, they will be lost when the job finishes!
 results_path = "logs"
 
 # Could be useful to be able to set where the symlink should be pointing to on each cluster.

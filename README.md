@@ -1,5 +1,10 @@
 # transformerXL_PPO_JAX
 
+> **This repo is a fork intended to be easier to read, use and tinker with. All credit goes to the authors of the original repo.**
+> This was modified from the source repo to use a flattened and simplified layout.
+> This is also adapted for easier launching of jobs on Slurm compute clusters, particularly those available to Mila researchers.
+
+
 This repository provides a JAX implementation of TranformerXL with PPO in a RL setup following :  "Stabilizing Transformers for Reinforcement Learning" from Parisotto et al. (https://arxiv.org/abs/1910.06764). 
 
 The code uses the [PureJaxRL](https://github.com/luchris429/purejaxrl) template for PPO and copied some of the code from [Huggingface transformerXL](https://github.com/huggingface/transformers/blob/v4.40.1/src/transformers/models/deprecated/transfo_xl/modeling_transfo_xl.py) transferring it to JAX. We also took inspiration from the pytorch code in https://github.com/MarcoMeter/episodic-transformer-memory-ppo, which has some simplification of gradient propagation and positional encoding compared to transformerXL as it is described in the original paper (https://arxiv.org/abs/1901.02860). 
@@ -12,21 +17,52 @@ The training of a 5M transformer on craftax for 1e9 steps (with 1024 environment
 
 ## Installation
 
-```
+```bash
 git clone git@github.com:Reytuag/transformerXL_PPO_JAX.git
 cd transformerXL_PPO_JAX
 uv sync
 ```
 
-:warning: By default, this will install the cpu version of JAX. You can install the GPU version of JAX using either the `cuda12` or `cuda13` dependency group.
+⚠️ By default, this will install the CPU version of Jax. You can install the GPU version of JAX using either the `cuda12` or `cuda13` dependency group.
 
+```bash
+# Default, uses the default cuda12 dependency group. Works on most of the Mila/DRAC clusters at the time of writing.
+uv sync
+
+# Install with cuda 13
+uv sync --no-default-groups --group=cuda13
+
+# Install CPU version (for example if you want to install with jax[tpu] or similar yourself.)
+uv sync --no-default-groups
 ```
-uv sync --group=cuda12
+
+These options can also be passed to `uv run` when running the code below.
+
+## Running the code
+
+
+You can run the experiments like so:
+```bash
+# To see all hyper-parameters and options:
+uv run python train.py --help
+
+# Craftax experiment (needs multiple GPUs)
+uv run python train.py --config_path configs/memorychain.yaml
+
+# Craftax experiment (needs multiple GPUs)
+uv run python train.py --config_path configs/craftax.yaml
+
+# Overwriting an argument:
+uv run python train.py --config_path configs/craftax.yaml --total_timesteps 10_000_000
 ```
+
+This fork does not add Hydra, for simplicity. Although you could easily add that yourself.
+
 
 ## Cluv example
 
 This repo is also used as a testbench for a new tool called `cluv`, being developed here at Mila.
+This allows you to easily run experiments on other Slurm clusters that you have access to.
 
 ```
 cluv run rorqual --group=cuda12 python train.py

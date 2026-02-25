@@ -364,6 +364,19 @@ def make_train(config: Config):
     # config.NUM_UPDATES = config.TOTAL_TIMESTEPS // config.NUM_STEPS // config.NUM_ENVS
     # config.MINIBATCH_SIZE = config.NUM_ENVS * config.NUM_STEPS // config.NUM_MINIBATCHES
 
+    env, env_params = make_env(config)
+
+    return lambda rng: train(
+        rng,
+        env=env,
+        env_params=env_params,
+        config=config,
+    )
+
+
+def make_env[EnvParams: gymnax.EnvParams](
+    config: Config,
+) -> tuple[Environment[gymnax.EnvState, EnvParams], EnvParams]:
     if config.env_name == "craftax":
         from craftax.craftax.envs.craftax_symbolic_env import (
             CraftaxSymbolicEnvNoAutoReset,
@@ -385,13 +398,7 @@ def make_train(config: Config):
         env = FlattenObservationWrapper(env)
         env = LogWrapper(env)
         env = BatchEnvWrapper(env, config.num_envs)
-
-    return lambda rng: train(
-        rng,
-        env=env,  # type: ignore
-        env_params=env_params,
-        config=config,
-    )
+    return env, env_params
 
 
 def train(
