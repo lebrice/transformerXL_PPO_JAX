@@ -4,6 +4,7 @@ import dataclasses
 import functools
 import os
 import shlex
+import socket
 import sys
 import time
 import typing
@@ -33,7 +34,12 @@ from wrappers import BatchEnvWrapper, LogWrapper, OptimisticResetVecEnvWrapper
 
 if typing.TYPE_CHECKING:
     from craftax.craftax.envs import craftax_symbolic_env
+REPO_ROOT = Path(__file__).parent
 
+SLURM_TMPDIR: Path | None = (
+    Path(os.environ["SLURM_TMPDIR"]) if "SLURM_TMPDIR" in os.environ else None
+)
+SCRATCH: Path | None = Path(os.environ["SCRATCH"]) if "SCRATCH" in os.environ else None
 
 type TEnvParams = EnvParams | craftax_symbolic_env.EnvParams
 
@@ -71,6 +77,10 @@ class Config:
     # Set dynamically based on other attributes:
     num_updates: int = 0
     minibatch_size: int = 0
+
+    output_dir: Path = Path("logs") / os.environ.get(
+        "SLURM_JOB_ID", f"{socket.gethostname()}_debug"
+    )
 
 
 MEMORYCHAIN_CONFIG = Config(
@@ -180,15 +190,12 @@ def main(argv: str | list[str] | None = None):
     )
 
     seed = config.seed
-    # todo: Also use SLURM_PROCID?
-    if not Path("logs").exists() and "SCRATCH" in os.environ:
+
+    if SLURM_TMPDIR and config.output_dir.is_relative_to(SLURM_TMPDIR):
+        # Need to create the symlink so the results don't only get written to slurm_tmpdir then deleted.
         Path("logs").symlink_to(
             Path(os.environ["SCRATCH"]) / "logs" / "transformerXL_PPO_JAX"  # FIXME
         )
-
-    output_dir = Path("logs") / os.environ.get(
-        "SLURM_JOB_ID", f"localdebug/{config.env_name}"
-    )
 
     try:
         if not os.path.exists(output_dir):
@@ -288,7 +295,8 @@ class ActorCriticTransformer(nn.Module):
             1, kernel_init=orthogonal(1.0), bias_init=constant(0.0)
         )
 
-    def __call__(self, memories, obs: jax.Array, mask: jax.Array):
+    # TODO: Add annotations using jaxtyping for each method.
+    def __call__(self, memories: jax.Array, obs: jax.Array, mask: jax.Array):
         x, memory_out = self.transformer(memories, obs, mask)
 
         actor_mean = self.actor_ln1(x)

@@ -20,7 +20,10 @@ echo "Running uv commands in directory: $UV_DIR"
 # TODO: Important: Since we don't yet use absolute paths in the config for the output directory, we need
 # to create a symlink from $UV_DIR/logs to `cwd`/logs (which hopefully is a symlink to somewhere in $SCRATCH).
 # TODO: Could also recopy the logs from $UV_DIR/logs to scratch at the end of the job.
-ln -s -t $UV_DIR logs
+
+# NOTE: $UV_DIR is *literally* '$SLURM_TMPDIR/repo_name', and $SLURM_TMPDIR is not evaluated yet.
+# todo: Evaluate UV_DIR 
+bash -c "ln -s -t $UV_DIR logs"
 
 
 # These environment variables are used by the torch and jax distributed modules, and should
@@ -46,6 +49,8 @@ export WORLD_SIZE=$SLURM_NTASKS
 # via shared memory but fails due to cgroups isolation.
 # See https://slurm.schedmd.com/srun.html#OPT_gres-flags
 # and https://support.schedmd.com/show_bug.cgi?id=17875 for details.
+# set +e
 srun --gres-flags=allow-task-sharing bash -c \
     "RANK=\$SLURM_PROCID LOCAL_RANK=\$SLURM_LOCALID \
     uv run --directory=$UV_DIR $@"
+# rsync -a $UV_DIR/logs logs
