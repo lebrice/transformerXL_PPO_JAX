@@ -19,7 +19,9 @@ echo "Running uv commands in directory: $UV_DIR"
 
 # TODO: Important: Since we don't yet use absolute paths in the config for the output directory, we need
 # to create a symlink from $UV_DIR/logs to `cwd`/logs (which hopefully is a symlink to somewhere in $SCRATCH).
+# TODO: Could also recopy the logs from $UV_DIR/logs to scratch at the end of the job.
 ln -s -t $UV_DIR logs
+
 
 # These environment variables are used by the torch and jax distributed modules, and should
 # ideally be set before running the python script, or at the very beginning of the python script.

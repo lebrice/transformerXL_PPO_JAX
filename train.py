@@ -8,6 +8,7 @@ import sys
 import time
 import typing
 from dataclasses import dataclass
+from pathlib import Path
 from typing import NamedTuple, Sequence
 
 import distrax
@@ -18,6 +19,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
+import rich_argparse
 import simple_parsing
 from flax.core import FrozenDict
 from flax.linen.initializers import constant, orthogonal
@@ -27,11 +29,7 @@ from gymnax.environments.environment import Environment, EnvParams
 from gymnax.wrappers.purerl import FlattenObservationWrapper
 
 from transformerXL import Transformer
-from wrappers import (
-    BatchEnvWrapper,
-    LogWrapper,
-    OptimisticResetVecEnvWrapper,
-)
+from wrappers import BatchEnvWrapper, LogWrapper, OptimisticResetVecEnvWrapper
 
 if typing.TYPE_CHECKING:
     from craftax.craftax.envs import craftax_symbolic_env
@@ -166,22 +164,37 @@ class Transition(NamedTuple):
 
 def main(argv: str | list[str] | None = None):
     argv = shlex.split(argv) if isinstance(argv, str) else argv or sys.argv
+
+    class HelpFormatter(  # type: ignore
+        rich_argparse.ArgumentDefaultsRichHelpFormatter,
+        rich_argparse.MetavarTypeRichHelpFormatter,
+        simple_parsing.SimpleHelpFormatter,
+    ): ...
+
     config = simple_parsing.parse(
         Config,
         default=MEMORYCHAIN_CONFIG,
         add_config_path_arg=True,
         description=__doc__,
+        formatter_class=HelpFormatter,
     )
 
     seed = config.seed
     # todo: Also use SLURM_PROCID?
-    prefix = "results_gymnax/" + config.env_name
+    if not Path("logs").exists() and "SCRATCH" in os.environ:
+        Path("logs").symlink_to(
+            Path(os.environ["SCRATCH"]) / "logs" / "transformerXL_PPO_JAX"  # FIXME
+        )
+
+    output_dir = Path("logs") / os.environ.get(
+        "SLURM_JOB_ID", f"localdebug/{config.env_name}"
+    )
 
     try:
-        if not os.path.exists(prefix):
-            os.makedirs(prefix)
+        if not os.path.exists(output_dir):
+            os.makedirs(output_dir)
     except IOError:
-        print("directory creation " + prefix + " failed")
+        print(f"directory creation {output_dir} failed")
 
     print("Start compiling and training")
     t = time.time()
@@ -207,14 +220,13 @@ def main(argv: str | list[str] | None = None):
     plt.plot(out["metrics"]["returned_episode_returns"])
     plt.xlabel("Updates")
     plt.ylabel("Return")
-    plt.savefig(prefix + "/return_" + str(seed))
+    plt.savefig(output_dir / f"return_{seed}")
 
     plt.clf()
 
-    jnp.save(prefix + "/" + str(seed) + "_params", out["runner_state"][0].params)
-    jnp.save(prefix + "/" + str(seed) + "_config", dataclasses.asdict(config))  # type: ignore
-
-    jnp.save(prefix + "/" + str(seed) + "_metrics", out["metrics"])
+    jnp.save(output_dir / f"{seed}_params", out["runner_state"][0].params)
+    jnp.save(output_dir / f"{seed}_config", dataclasses.asdict(config))  # type: ignore
+    jnp.save(output_dir / f"{seed}_metrics", out["metrics"])
 
 
 class ActorCriticTransformer(nn.Module):
@@ -401,14 +413,10 @@ def make_env[EnvParams: gymnax.EnvParams](
     return env, env_params
 
 
-def train(
-    rng: jax.Array,
-    env: Environment,
-    env_params: EnvParams | craftax_symbolic_env.EnvParams,
-    config: Config,
+def create_network(
+    config: Config, env: Environment, env_params: EnvParams, rng: jax.Array
 ):
-    # INIT NETWORK
-    network = ActorCriticTransformer(
+    return ActorCriticTransformer(
         action_dim=env.action_space(env_params).n,
         activation=config.activation,
         encoder_size=config.embed_size,
@@ -419,6 +427,15 @@ def train(
         gating=config.gating,
         gating_bias=config.gating_bias,
     )
+
+
+def init_network(
+    rng: jax.Array,
+    network: nn.Module,
+    config: Config,
+    env: Environment,
+    env_params: EnvParams,
+):
     rng, network_init_params_rng = jax.random.split(rng)
     init_obs = jnp.zeros((2, env.observation_space(env_params).shape[0]))
     init_memory = jnp.zeros(
@@ -430,6 +447,20 @@ def train(
     network_params = network.init(
         network_init_params_rng, init_memory, init_obs, init_mask
     )
+
+    return network_params
+
+
+def create_initial_state(
+    rng: jax.Array,
+    network: nn.Module,
+    config: Config,
+    env: Environment,
+    env_params: TEnvParams,
+) -> RunnerState:
+    # INIT NETWORK
+    # network = create_network(config, env, env_params, rng)
+    network_params = init_network(rng, network, config, env, env_params)
 
     if config.anneal_lr:
         learning_rate = functools.partial(
@@ -481,22 +512,45 @@ def train(
     )
     done = jnp.zeros((config.num_envs,), dtype=jnp.bool_)
 
-    runner_state = RunnerState(
-        train_state,
-        env_state,
-        memories,
-        memories_mask,
-        memories_mask_idx,
-        obsv,
-        done,
-        0,
-        network_init_params_rng,
+    return RunnerState(
+        train_state=train_state,
+        env_state=env_state,
+        memories=memories,
+        memories_mask=memories_mask,
+        memories_mask_idx=memories_mask_idx,
+        obsv=obsv,
+        done=done,
+        steps=0,
+        rng=network_init_params_rng,
+    )
+
+
+def train(
+    rng: jax.Array,
+    env: Environment,
+    env_params: EnvParams | craftax_symbolic_env.EnvParams,
+    config: Config,
+):
+    # TODO: network_params is created twice. Perhaps network should be an input argument here.
+    network = ActorCriticTransformer(
+        action_dim=env.action_space(env_params).n,
+        activation=config.activation,
+        encoder_size=config.embed_size,
+        hidden_layers=config.hidden_layers,
+        num_heads=config.num_heads,
+        qkv_features=config.qkv_features,
+        num_layers=config.num_layers,
+        gating=config.gating,
+        gating_bias=config.gating_bias,
+    )
+    runner_state = create_initial_state(
+        rng, network=network, config=config, env=env, env_params=env_params
     )
     runner_state, metric = jax.lax.scan(
-        lambda runner_state, _step: _update_step(
+        lambda runner_state, _step: update_step(
             runner_state,
             _step,
-            memories_mask=memories_mask,
+            memories_mask=runner_state.memories_mask,
             network=network,
             env=env,
             env_params=env_params,
@@ -510,7 +564,7 @@ def train(
     return {"runner_state": runner_state, "metrics": metric}
 
 
-def _env_step(
+def env_step(
     runner_state: RunnerState,
     _step_index: jax.Array,
     env: Environment,
@@ -624,7 +678,7 @@ def _env_step(
     return runner_state, (transition, memories_out)
 
 
-def _update_step(
+def update_step(
     runner_state: RunnerState,
     _update_index: jax.Array,
     *,
@@ -640,7 +694,7 @@ def _update_step(
 
     # SCAN THE STEP TO GET THE TRANSITIONS AND CACHED MEMORIES
     runner_state, (traj_batch, memories_batch) = jax.lax.scan(
-        lambda _runner_state, _step: _env_step(
+        lambda _runner_state, _step: env_step(
             _runner_state,
             _step,
             env=env,
@@ -676,7 +730,7 @@ def _update_step(
     _, last_val, _ = outputs
     assert isinstance(last_val, jax.Array)
 
-    advantages, targets = _calculate_gae(traj_batch, last_val, config=config)
+    advantages, targets = calculate_gae(traj_batch, last_val, config=config)
 
     # UPDATE NETWORK
     # ADD PREVIOUS WINDOW_MEM To the current NUM_STEPS SO THAT FIRST STEPS USE MEMORIES FROM PREVIOUS
@@ -706,7 +760,7 @@ def _update_step(
         rng=rng,
     )
     update_state, loss_info = jax.lax.scan(
-        lambda _update_state, _step: _update_epoch(
+        lambda _update_state, _step: update_epoch(
             _update_state,
             _step,
             network=network,
@@ -732,7 +786,7 @@ def _update_step(
     return runner_state, metric
 
 
-def _update_epoch(
+def update_epoch(
     update_state: UpdateState,
     _index: jax.Array,
     *,
@@ -764,7 +818,7 @@ def _update_epoch(
     )
 
     train_state, total_loss = jax.lax.scan(
-        lambda _train_state, _step: _update_minbatch(
+        lambda _train_state, _step: update_minbatch(
             _train_state,
             _step,
             network=network,
@@ -785,7 +839,7 @@ def _update_epoch(
     return update_state, total_loss
 
 
-def _update_minbatch(
+def update_minbatch(
     train_state: TrainState,
     batch_info: tuple[Transition, jax.Array, jax.Array, jax.Array],
     *,
@@ -910,9 +964,9 @@ def loss_fn(
     return total_loss, (value_loss, loss_actor, entropy)
 
 
-def _calculate_gae(traj_batch: Transition, last_val: jax.Array, config: Config):
+def calculate_gae(traj_batch: Transition, last_val: jax.Array, config: Config):
     _, advantages = jax.lax.scan(
-        lambda gae_next_val, transition: _get_advantages(
+        lambda gae_next_val, transition: get_advantages(
             gae_next_val, transition, gamma=config.gamma, gae_lambda=config.gae_lambda
         ),
         (jnp.zeros_like(last_val), last_val),
@@ -923,7 +977,7 @@ def _calculate_gae(traj_batch: Transition, last_val: jax.Array, config: Config):
     return advantages, advantages + traj_batch.value
 
 
-def _get_advantages(
+def get_advantages(
     gae_and_next_value: tuple[jax.Array, jax.Array],
     transition: Transition,
     *,

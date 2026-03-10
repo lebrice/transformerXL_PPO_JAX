@@ -17,12 +17,16 @@ dependencies = [
     "matplotlib>=3.10.8",
     "optax>=0.2.6",
     "orbax-checkpoint>=0.11.0",
+    "rich-argparse>=1.7.2",
     "seaborn>=0.13.2",
     "simple-parsing>=0.1.8",
 ]
 
 
 [dependency-groups]
+# on rorqual for instance, still necessary to use cuda12
+# TODO: Look into an environment variable that could be set in the job script to select the group used based on which cluster we're on?
+# OR, perhaps better, specify some arguments to be passed to `uv run` via the cluv config for a particular cluster?
 cuda12 = ["jax[cuda12]>=0.9.0.1"]
 cuda13 = ["jax[cuda13]>=0.9.0.1"]
 
@@ -31,7 +35,7 @@ cuda13 = ["jax[cuda13]>=0.9.0.1"]
 conflicts = [[{ group = "cuda12" }, { group = "cuda13" }]]
 
 # TODO: Would it be better to setup a default group that works on most clusters?
-default-groups = ["cuda12"]
+# default-groups = ["cuda12"]
 
 
 [tool.uv.sources]
