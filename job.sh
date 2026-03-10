@@ -17,6 +17,10 @@ UV_DIR=$(./code_checkpointing.sh)
 echo "Git commit used for this job: ${GIT_COMMIT:-not set - code checkpointing is not enabled}"
 echo "Running uv commands in directory: $UV_DIR"
 
+# TODO: Important: Since we don't yet use absolute paths in the config for the output directory, we need
+# to create a symlink from $UV_DIR/logs to `cwd`/logs (which hopefully is a symlink to somewhere in $SCRATCH).
+ln -s -t $UV_DIR logs
+
 # These environment variables are used by the torch and jax distributed modules, and should
 # ideally be set before running the python script, or at the very beginning of the python script.
 # Master address is the hostname of the first node in the job.
